@@ -1,0 +1,108 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+spec:
+  selector:
+    app: redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: celery-long-job
+  annotations:
+    karpenter.sh/do-not-disrupt: "true"
+    cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+spec:
+  jobTargetRef:
+    template:
+      metadata:
+        labels:
+          app: celery-long-job
+      spec:
+        restartPolicy: Never
+        shareProcessNamespace: true
+        containers:
+          - name: celery-warm-shutdown
+            image: alpine:3.23
+            command:
+              - sh
+              - -c
+              - |
+                sleep 60
+                kill -SIGTERM $(ps -eo pid,ppid,args | grep 'celery -A' | grep -v 'grep' | awk '$2 == 0 {print $1}')
+          - name: celery-long-job
+            image: baydakovss/celery-scaled-jobs:0.0.1
+            imagePullPolicy: Always
+            env:
+              - name: CELERY_BROKER_URL
+                value: redis://redis:6379/0
+            command:
+              - celery
+              - -A
+              - app
+              - worker
+              - -Q
+              - heavy_jobs
+              - -c
+              - "1"
+              - -l
+              - debug
+              - --without-gossip
+              - --disable-prefetch
+              - --max-tasks-per-child=1
+            resources:
+              requests:
+                cpu: 10m
+                memory: 256Mi
+              limits:
+                cpu: 500m
+                memory: 500Mi
+  pollingInterval: 20
+  successfulJobsHistoryLimit: 10
+  failedJobsHistoryLimit: 30
+  maxReplicaCount: 5
+  scalingStrategy:
+    strategy: eager
+    # Prevent duplicate jobs while Celery worker is starting up before task is ingested by worker / short pollingInterval
+    pendingPodConditions:
+      #- Ready
+      - PodScheduled
+  triggers:
+    - type: redis
+      metadata:
+        address: redis.test.svc.cluster.local:6379
+        listName: heavy_jobs
+        # One task - one job
+        listLength: "1"
+        databaseIndex: "0"
